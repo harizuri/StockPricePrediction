@@ -9,3 +9,13 @@
 ・バッチ処理の起動
 ・デスクトップアプリケーションからの起動対応
 
+## 予測モデル
+### base_pattern
+ Accuracy: 0.746
+Classification Report:
+              precision    recall  f1-score   support
+           0       0.89      0.76      0.82        54
+           1       0.48      0.71      0.57        17
+    accuracy                           0.75        71
+   macro avg       0.69      0.73      0.70        71
+weighted avg       0.79      0.75      0.76        71
