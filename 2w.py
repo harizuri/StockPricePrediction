@@ -4,7 +4,11 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.model_selection import train_test_split
 from imblearn.under_sampling import RandomUnderSampler
+from functools import reduce
+import pandas as pd
 import pickle
 import lightgbm as lgb
 import sampling as DATA
@@ -13,11 +17,12 @@ import os
 TEST_SPLIT_DATE = '2025-02-01'    # テストデータを使用する期間
 PREDICATION_DATE = 14             # 何日後を予測するか"
 MODEL_DIR = "../model/"
+FEATURES = "../features/"
 
 # terget:銘柄コード
 class base_pattern:
     def __init__(self):
-        self.stock_target = "8306.T"
+        self.stock_target = "1605.T"
         self.teain_period = "3y" #学習データの期間
         self.upward_rate = 0.07 # 何%の上昇を正解データにするか
         self.prediction_date = 14 #何日後を予測するか
@@ -56,7 +61,10 @@ class base_pattern:
     def train_main(self):
         print("****** train start ******")
         print("****** 学習データ サンプリング ******")
-        features, target, dates = self.make_data(self.stock_target,self.teain_period)
+        #features, target, dates = self.make_data(self.stock_target,self.teain_period)
+        features, target, df = self.make_data(self.stock_target,self.teain_period)
+        df.to_csv(FEATURES+self.__class__.__name__+'features.csv', index=False, encoding='utf-8')
+        print("特徴量保存:",FEATURES+self.__class__.__name__+'features.csv')
         print("****** 学習 ******")
         model, y_test, y_pred = self.train_and_evaluate(features, target)
         print("****** 学習 ログ作成 ******")
@@ -114,7 +122,7 @@ class base_pattern:
         target = df['Target']
         print("最終データ数")
         print(df['Target'].value_counts())
-        return features, target, df.index
+        return features, target, df
         
     def com_data(self,period):
         stock = DATA.ComData(period)
@@ -141,9 +149,119 @@ class base_pattern:
         
         return df
         
+class multi_pattern(base_pattern):
+    def __init__(self):
+        # 複数銘柄リスト
+        self.stock_targets = ['9433.T','9434.T','6098.T','9766.T','9412.T']
+        self.teain_period = "3y"
+        self.upward_rate = 0.07
+        self.prediction_date = 14
+        self.df_com = self.com_data(self.teain_period)
+        self.feature_names = ""
+    
+    def make_data(self):
+        """複数銘柄マルチラベル学習用データ作成"""
+        df_list = []
+        for target in self.stock_targets:
+            stock = DATA.StockData(target, self.teain_period)
+            df = stock.get_stock_data()
+            df[f"{target}_Target"] = ((df['Close'].shift(-self.prediction_date) - df['Close']) / df['Close'] >= self.upward_rate).astype(int)
+            print(target)
+            print(df[f"{target}_Target"].value_counts())
+
+            # 日付特徴量
+            df['Weekday'] = df.index.weekday
+            df = pd.get_dummies(df, columns=['Weekday'])
+            df.index = df.index.tz_localize(None)
+
+            # 共通データ結合
+            df = df.merge(self.df_com[['JPY_Close','energy_Close','metalX_Close','ap_Close']], how='inner', left_index=True, right_index=True)
+            df['JPY_Close'] = df['JPY_Close'].ffill()
+            df.dropna(subset=[f"{target}_Target"], inplace=True)
+
+            # 特徴量列
+            feature_cols = ['Close','Volume','JPY_Close','energy_Close','metalX_Close','ap_Close'] + [col for col in df.columns if col.startswith('Weekday_')]
+            df_features = df[feature_cols].copy()
+            df_features.columns = [f"{target}_{c}" for c in df_features.columns]  # 銘柄名プレフィックス
+            df_features[f"{target}_Target"] = df[f"{target}_Target"]
+            df_list.append(df_features)
+
+        # 日付で内部結合
+        df_all = reduce(lambda left,right: left.join(right, how='inner'), df_list)
+        feature_cols_all = [c for c in df_all.columns if not c.endswith('_Target')]
+        target_cols_all = [c for c in df_all.columns if c.endswith('_Target')]
+        X = df_all[feature_cols_all]
+        y = df_all[target_cols_all]
+        self.feature_names = X.columns
+        print("学習データ形状:", X.shape)
+        print("ターゲット形状:", y.shape)
+        return X, y
+
+    def train_model(self, X, y):
+        """マルチラベル学習"""
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=42)
+
+        # MultiOutputClassifier
+        base_model = RandomForestClassifier(random_state=42, class_weight='balanced')
+        model = MultiOutputClassifier(base_model)
+        model.fit(X_train, y_train)
+
+        y_pred = pd.DataFrame(model.predict(X_test), columns=y_test.columns, index=y_test.index)
+
+        # 各銘柄ごとに評価
+        for col in y_test.columns:
+            print(f"== {col} ==")
+            print(classification_report(y_test[col], y_pred[col]))
+
+        return model
+
+    def train_main(self):
+        print("****** train start ******")
+        X, y = self.make_data()
+        model = self.train_model(X, y)
+        # モデル保存
+        with open(MODEL_DIR+self.__class__.__name__+'_model.pkl', 'wb') as f:
+            pickle.dump(model, f)
+            print("モデル保存:", MODEL_DIR+self.__class__.__name__+'_model.pkl')
+        return model
+
+    def prediction(self, target):
+        """複数銘柄学習モデルから1銘柄の予測"""
+        with open(MODEL_DIR+self.__class__.__name__+'_model.pkl', 'rb') as f:
+            model = pickle.load(f)
+
+        stock = DATA.StockData(target,"2wk")
+        df = stock.get_stock_data()
+        df['Weekday'] = df.index.weekday
+        df.index = df.index.tz_localize(None)
+        df = pd.get_dummies(df, columns=['Weekday'])
+        df = df.merge(self.df_com[['JPY_Close','energy_Close','metalX_Close','ap_Close']], how='inner', left_index=True, right_index=True)
+        
+        # 最新データ取得
+        latest = df.iloc[[-1]].copy()
+        cols = ['Close','Volume','JPY_Close','energy_Close','metalX_Close','ap_Close'] + [c for c in latest.columns if c.startswith('Weekday_')]
+        latest = latest[cols]
+
+        # 特徴量をマルチラベルモデル用に変換
+        prefixed_cols = [f"{target}_{c}" for c in latest.columns]
+        latest.columns = prefixed_cols
+
+        # モデルにない列があれば0埋め
+        for c in model.estimators_[0].feature_names_in_:
+            if c not in latest.columns:
+                latest[c] = 0
+        latest = latest[model.estimators_[0].feature_names_in_]
+
+        pred = model.predict(latest)[0]
+        prob = model.predict_proba(latest)[0][1]
+
+        print(f"{target} の予測結果: {'上昇 (買いシグナル)' if pred==1 else '上昇せず'}, 確率: {prob:.2%}")
+        return pred, prob
+    
+    
 if __name__ == "__main__":
     pattern = base_pattern()
     # 学習
-    pattern.train_main()
+    #pattern.train_main()
     # 予測
     pattern.prediction()
